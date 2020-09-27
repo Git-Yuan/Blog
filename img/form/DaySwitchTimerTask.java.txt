@@ -1,0 +1,420 @@
+package com.beichende.ibank.timer.scheduler;
+
+import java.io.File;
+import java.io.Serializable;
+import java.text.DateFormat;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.List;
+import java.util.Random;
+import java.util.TimerTask;
+import java.util.concurrent.TimeUnit;
+
+import org.apache.log4j.Logger;
+
+import com.beichende.ibank.caching.constant.CachingDataNameConstant;
+import com.beichende.ibank.common.utils.FileUtil;
+import com.beichende.ibank.ibankcommon.tradecommon.constant.ParamConstant;
+import com.beichende.icache.core.ICacheService;
+import com.beichende.icomm.util.UUIDUtil;
+
+/**
+ * 日切定时任务处理类
+ * @author mid
+ * @version 1.0.0
+ * @filename DaySwitchTimerTask.java
+ * @time 2015-8-18 下午4:02:36
+ * @copyright(C) 2015 深圳市北辰德科技股份有限公司
+ */
+public class DaySwitchTimerTask extends TimerTask {
+	private static final Logger logger = Logger.getLogger(DaySwitchTimerTask.class);
+	private String DaySwitchingFlag = "DaySwitchingFlag";				//日切执行中标识
+	private String DaySwitchedFlag = "DaySwitchedFlag";					//日切已执行标识
+	private String DaySwitchDate = "DaySwitchDate";						//日切日期
+	private static String cusBusiIdSeq = "Seq_CusBusiId_Day";			//客户级流水序列
+	private static String acceptIdSeq = "Seq_AcceptId_Day";				//业务受理流水序列
+	private static String tradeIdSeq = "Seq_TradeId_Day";				//交易流水序列
+	private static String taskIdSeq ="Seq_TaskNo_Day";					//重空任务序列
+	private static String preIdSeq ="Seq_PreId_Day";					//预填单号流水序列
+	@Override
+	public void run() {
+		logger.info("日期切换定时处理启动...");
+		//随机一个0-100秒时间，防止集群部署的时候并发执行日期切换
+		String uuuid=UUIDUtil.getRandomId();
+		int random=Math.abs(uuuid.hashCode())%10;
+		try 
+		{
+			logger.info("当前任务随机等待["+(random+1)*10+"]秒后执行");
+			TimeUnit.SECONDS.sleep((random+1)*10);
+		} catch (InterruptedException e2) 
+		{
+			logger.warn("日期切换定时处理任务类sleep 异常打断["+e2.getMessage()+"]",e2);
+		}
+		
+		boolean ret = check();
+		if(ret) {
+			//需要进行后续处理
+			//切换工作日期
+			//获取当前工作日期
+			String workDate = DaySwitchTimerScheduler.getInstance().
+					getCachingService().getSysParameter(ParamConstant.Base.Sys_WorkDate, new StringBuffer()).getParamValue();
+			StringBuffer tmpBuf = new StringBuffer();
+			if(null == workDate || "".equals(workDate)) {
+				logger.warn("获取系统工作日期异常，无法进行日切");
+				//还原日切中标识
+				ret = ICacheService.updateAtomicObject(DaySwitchingFlag, false, tmpBuf);
+				logger.info("还原日切中标识结果为[" + ret + ":" + tmpBuf.toString() + "]");
+			} else {
+				//切换工作日期
+				Calendar calendar = Calendar.getInstance();
+				try {
+					calendar.setTime(new SimpleDateFormat("yyyyMMdd").parse(workDate));
+				} catch (ParseException e1) {
+					e1.printStackTrace();
+				}
+				calendar.add(Calendar.DAY_OF_YEAR, 1);
+				workDate = new SimpleDateFormat("yyyyMMdd").format(calendar.getTime());
+				String hql = "update SysParameter set paramValue='" + workDate + "' where paramCode='WorkDate'";
+				try {
+					int rret = DaySwitchTimerScheduler.getInstance().getBaseService().updateByHql(hql,tmpBuf);
+					logger.info("更新系统工作日期结果为[" + rret + ":" + workDate+ "]"+tmpBuf.toString());
+					
+					//刷新全量缓存数据
+					logger.info("开始刷新全量的缓存数据.....");
+					ret = DaySwitchTimerScheduler.getInstance().getCachingService().refreshCaching(
+							CachingDataNameConstant.AllTable, "", "", tmpBuf);
+					logger.info("刷新全量缓存数据的结果为[" + ret + ":" + tmpBuf.toString() + "]");
+					// 清理本地缓存文件
+					clearLocalCacheFiles();
+					// 重置流水号序列 Add by Vires @20190718
+					DaySwitchTimerScheduler.getInstance().getFlowIdGenerator().resetIdSeqValue();
+					
+					//刷新日切数据
+					String switchDate = new SimpleDateFormat("yyyyMMdd").format(Calendar.getInstance().getTime());
+					tmpBuf = new StringBuffer();
+					ret = ICacheService.updateAtomicObject(DaySwitchDate, switchDate, tmpBuf);
+					logger.info("刷新日切日期结果为[" + ret + ":" + tmpBuf.toString() + "]");
+					tmpBuf = new StringBuffer();
+					ret = ICacheService.updateAtomicObject(DaySwitchedFlag, true, tmpBuf);
+					logger.info("刷新已日切标识结果为[" + ret + ":" + tmpBuf.toString() + "]");
+					tmpBuf = new StringBuffer();
+					ret = ICacheService.updateAtomicObject(DaySwitchingFlag, false, tmpBuf);
+					logger.info("刷新日切中标识结果为[" + ret + ":" + tmpBuf.toString() + "]");
+				} catch (Exception e) {
+					logger.warn("更新系统工作日期异常[" + e.getMessage() + "]", e);
+				}
+			}
+		} else {
+			//无需进行后续处理
+			//延时后继续
+			try {
+				Thread.sleep(60 * 100);
+			} catch (InterruptedException e) {
+				e.printStackTrace();
+			}
+		}
+		logger.info("日期切换定时处理完毕");
+		//重新启动下一次定时时间
+		Date nextTime = getNextScheduleTime();
+		DaySwitchTimerScheduler.getInstance().setTask(new DaySwitchTimerTask(), nextTime);
+		logger.info("设置下一次执行时间完毕，下一次执行时间为[" + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(nextTime) + "]");
+	}
+	
+	/**
+	 * 清理本地缓存文件
+	 */
+	private static void clearLocalCacheFiles() {
+		
+		// 清理本地缓存文件
+		logger.info("开始清理本地缓存文件.....");
+		
+		/******************** 清理相对系统根路径下的文件 start **********************/
+		
+		// 清理影像缓存目录
+		String dirPath = "/opt/BCD/PImageCache";
+		logger.info("清理" + dirPath);
+		boolean delRes = FileUtil.deleteDirExcludSelf(dirPath);
+		logger.info("清理" + dirPath + "完成，结果[" + delRes + "]");
+		
+		// 清理申请书生成临时目录
+		dirPath = "/opt/BCD/appbook/booktemp";
+		logger.info("清理" + dirPath);
+		delRes = FileUtil.deleteDirExcludSelf(dirPath);
+		logger.info("清理" + dirPath + "完成，结果[" + delRes + "]");
+		// 清理申请书生成临时目录
+		dirPath = "/opt/BCD/appbookbooktemp";
+		logger.info("清理" + dirPath);
+		delRes = FileUtil.deleteDirExcludSelf(dirPath);
+		logger.info("清理" + dirPath + "完成，结果[" + delRes + "]");
+		
+		// 清理交易报文下载临时目录
+		dirPath = "/opt/BCD/trace/ziptmp";
+		logger.info("清理" + dirPath);
+		delRes = FileUtil.deleteDirExcludSelf(dirPath);
+		logger.info("清理" + dirPath + "完成，结果[" + delRes + "]");
+		
+		// 根据时间清理报文目录
+		// p端
+		dirPath = "/opt/BCD/trace/platform";
+		clearHisTraceFile(dirPath, 3);// 保留3个月
+		// c端
+		dirPath = "/opt/BCD/trace/ibank2";
+		clearHisTraceFile(dirPath, 3);// 保留3个月
+		// v端
+		dirPath = "/opt/BCD/trace/ibank-v";
+		clearHisTraceFile(dirPath, 3);// 保留3个月
+		
+		// 清理机构柜员同步产生的临时文件(清理3个月前创建的文件)
+		dirPath = "/opt/BCD/pms/synfile";
+		File tmpFile = new File(dirPath);
+		if (tmpFile.exists() && tmpFile.isDirectory()) {
+			List<String> clearPaths = new ArrayList<String>();// 待清理的目录
+			Calendar calendar = Calendar.getInstance();
+			calendar.add(Calendar.MONTH, -3);
+			File[] tmpFs = tmpFile.listFiles();
+			Calendar tmpCalendar = Calendar.getInstance();
+			for (int i=0; i<tmpFs.length; i++) {
+				tmpCalendar.setTimeInMillis(tmpFs[i].lastModified());
+				if (calendar.getTime().after(tmpCalendar.getTime())) {
+					clearPaths.add(tmpFs[i].getName());
+				}
+			}
+			
+			String tmpPath = "";
+			for (int i=0; i<clearPaths.size(); i++) {
+				tmpPath = dirPath + "/" + clearPaths.get(i);
+				logger.info("清理" + tmpPath);
+				delRes = FileUtil.deleteFile(tmpPath);
+				logger.info("清理" + tmpPath + "完成，结果[" + delRes + "]");
+			}
+		} else {
+			logger.warn("不存在或非目录，不清理" + dirPath);
+		}
+		
+		// 清理报表临时文件 add by Vires @20190307
+		dirPath = "/opt/BCD/reportstmp";
+		logger.info("清理" + dirPath);
+		delRes = FileUtil.deleteDirExcludSelf(dirPath);
+		logger.info("清理" + dirPath + "完成，结果[" + delRes + "]");
+		
+		// 清理客户图片临时目录
+		dirPath = "/opt/BCD/CustImgPath";
+		logger.info("清理" + dirPath);
+		delRes = FileUtil.deleteDirExcludSelf(dirPath);
+		logger.info("清理" + dirPath + "完成，结果[" + delRes + "]");
+		/******************** 清理相对系统根路径下的文件 end **********************/
+		
+		/******************** 清理相对web容器所在路径下的文件 start **********************/
+		
+//		// 获取项目根路径
+//		String path = Thread.currentThread().getContextClassLoader().getResource("/").getPath();
+//		path = path.replace("WEB-INF/classes/", "");
+//		
+//		// 清理后台查询申请书缓存目录(web应用目录)
+//		dirPath = path + "adm/busilistinfo/tmppdf";
+//		logger.info("清理" + dirPath);
+//		delRes = FileUtil.deleteDirExcludSelf(dirPath);
+//		logger.info("清理" + dirPath + "完成，结果[" + delRes + "]");
+//		
+//		// 清理后台查询图片缓存目录(web应用目录)
+//		dirPath = path + "adm/busilistinfo/tmpimage";
+//		logger.info("清理" + dirPath);
+//		delRes = FileUtil.deleteDirExcludSelf(dirPath);
+//		logger.info("清理" + dirPath + "完成，结果[" + delRes + "]");
+//		
+//		// 清理打印pdf临时目录(web应用目录)
+//		dirPath = path + "booktemp/pdf";
+//		logger.info("清理" + dirPath);
+//		delRes = FileUtil.deleteDirExcludSelf(dirPath);
+//		logger.info("清理" + dirPath + "完成，结果[" + delRes + "]");
+//
+//		// 清理设备日志下载临时目录(web应用目录)
+//		dirPath = path + "booktemp/deviceLog";
+//		logger.info("清理" + dirPath);
+//		delRes = FileUtil.deleteDirExcludSelf(dirPath);
+//		logger.info("清理" + dirPath + "完成，结果[" + delRes + "]");
+//		
+//		// 清理理财产品说明书临时存放路径(相对web容器)
+//		dirPath = path + DaySwitchTimerScheduler.getInstance().getCachingService().getSysParameter("FinanceFileLocalPath", new StringBuffer()).getParamValue();
+//		logger.info("清理" + dirPath);
+//		delRes = FileUtil.deleteDirExcludSelf(dirPath);
+//		logger.info("清理" + dirPath + "完成，结果[" + delRes + "]");
+//		
+//		// 清理购汇申请书临时目录(web应用目录)
+//		dirPath = path + "trade/foreignexchanger/exchangpurchase/img";
+//		logger.info("清理" + dirPath);
+//		delRes = FileUtil.deleteDirExcludSelf(dirPath);
+//		logger.info("清理" + dirPath + "完成，结果[" + delRes + "]");
+		/******************** 清理相对web容器所在路径下的文件 start **********************/
+		
+		logger.info("清理本地缓存文件完成。");
+	}
+	
+	/**
+	 * 清理报文文件
+	 * @param traceDirPath 报文文件所在目录
+	 * @param storMon 报文保存时间
+	 */
+	private static void clearHisTraceFile(String dirPath, int storMon) {
+		
+		File tmpFile = new File(dirPath);
+		if (tmpFile.exists() && tmpFile.isDirectory()) {
+			// 存在且为目录时
+			List<String> clearPaths = new ArrayList<String>();// 待清理的目录
+			String[] dirNames = tmpFile.list();
+			Calendar calendar = Calendar.getInstance();
+			calendar.add(Calendar.MONTH, (0 - storMon));
+			DateFormat df = new SimpleDateFormat("yyyyMMdd");
+			Date tmpDate = null;
+			for (int i=0; i<dirNames.length; i++) {
+				try {
+					tmpDate = df.parse(dirNames[i]);
+				} catch (ParseException e) {
+					logger.warn(dirNames[i] + "转换成时间对象异常，跳过", e);
+					continue;
+				}
+				if (calendar.getTime().after(tmpDate)) {
+					clearPaths.add(dirNames[i]);
+				}
+			}
+			
+			String tmpPath = "";
+			boolean delRes = false;
+			for (int i=0; i<clearPaths.size(); i++) {
+				tmpPath = dirPath + "/" + clearPaths.get(i);
+				logger.info("清理" + tmpPath);
+				delRes = FileUtil.deleteFile(tmpPath);
+				logger.info("清理" + tmpPath + "完成，结果[" + delRes + "]");
+			}
+		} else {
+			logger.warn("不存在或非目录，不清理" + dirPath);
+		}
+	}
+	
+	/**
+	 * 判定是否需要执行
+	 * @return					返回处理结果，TRUE代表本节点执行，FALSE代表本节点不执行
+	 */
+	public boolean check() {
+		//10秒后，1分钟随机延时后开始执行，防止多台部署并发执行
+		int interval = Math.abs(new Random().nextInt() % 60);
+		try {
+			Thread.sleep(10 * 1000 + interval * 1000);
+		} catch (InterruptedException e) {
+			e.printStackTrace();
+		}
+		StringBuffer tmpBuf = new StringBuffer();
+		Serializable obj = ICacheService.getAtomicObject(DaySwitchingFlag, tmpBuf);
+		if(null == obj) {
+			//不存在日切中标识，继续处理
+			tmpBuf = new StringBuffer();
+			boolean ret = ICacheService.saveAtomicObject(DaySwitchingFlag, true, tmpBuf);
+			if(!ret) {
+				logger.warn("增加日切中标识失败[" + tmpBuf.toString() + "]");
+				return false;
+			}
+			tmpBuf = new StringBuffer();
+			ret = ICacheService.saveAtomicObject(DaySwitchedFlag, false, tmpBuf);
+			if(!ret) {
+				logger.warn("增加已日切标识失败[" + tmpBuf.toString() + "]");
+				return false;
+			}
+			tmpBuf = new StringBuffer();
+			ret = ICacheService.saveAtomicObject(DaySwitchDate, "", tmpBuf);
+			if(!ret) {
+				logger.warn("增加日切日期失败[" + tmpBuf.toString() + "]");
+				return false;
+			}
+		} else if(Boolean.valueOf(obj.toString())) {
+			//日切中，无需进行后续处理
+			logger.info("已有其它节点进行日切操作，无需继续处理");
+			return false;
+		} else {
+			//非日切中，判断当天是否已初始化
+			tmpBuf = new StringBuffer();
+			Serializable oobj = ICacheService.getAtomicObject(DaySwitchedFlag, tmpBuf);
+			if(null == oobj) {
+				//不存在此种情况，无需考虑
+				return false;
+			} else if(Boolean.valueOf(oobj.toString())) {
+				//已日切
+				logger.info("已完成当天日切操作，无需继续处理");
+				//判断日切日期是否为今天
+				tmpBuf = new StringBuffer();
+				Serializable dateObj = ICacheService.getAtomicObject(DaySwitchDate, tmpBuf);
+				if(null == dateObj) {
+					//无日切日期，当天未进行日切操作，此种情况不存在
+				} else {
+					String switchDate = dateObj.toString();
+					if(switchDate.equals(new SimpleDateFormat("yyyyMMdd").format(Calendar.getInstance().getTime()))) {
+						//日切日期与当天日期一致，无需再处理
+						logger.info("已完成当天日切操作，无需继续处理");
+						return false;
+					} else {
+						//日切日期与当天日期不一致，需继续处理
+					}
+				}
+			} else {
+				//当天未日切，需要启动处理
+			}
+		}
+		//更新日切中标识
+		tmpBuf = new StringBuffer();
+		boolean ret = ICacheService.updateAtomicObject(DaySwitchingFlag, true, tmpBuf);
+		if(!ret) {
+			logger.warn("更新日切中标识失败[" + tmpBuf.toString() + "]");
+			return false;
+		}
+		//更新已日切标识
+		tmpBuf = new StringBuffer();
+		ret = ICacheService.updateAtomicObject(DaySwitchedFlag, false, tmpBuf);
+		if(!ret) {
+			logger.warn("更新已日切标识失败[" + tmpBuf.toString() + "]");
+			return false;
+		}
+		return true;
+	}
+	
+	/**
+	 * 获取下一次定时执行时间
+	 * @return					返回下一次执行时间，失败或异常时返回空
+	 */
+	private Date getNextScheduleTime() {
+		//获取日切时间
+//		String switchTime = DaySwitchTimerScheduler.getInstance().getParamGetter().getParam_Base(ParamConstant.Base.Sys_SwitchTime);
+		String switchTime = DaySwitchTimerScheduler.getInstance().getCachingService().getSysParameter(ParamConstant.Base.Sys_SwitchTime, new StringBuffer()).getParamValue();
+		if(null == switchTime || "".equals(switchTime)) {
+			logger.warn("获取系统日切时间异常，无法初始化定时处理任务");
+			return null;
+		} else {
+			int sth = -1;
+			int stm = -1;
+			try {
+				String[] strs = switchTime.split(":");
+				sth = Integer.parseInt(strs[0]);
+				stm = Integer.parseInt(strs[1]);
+				if(sth < 0 || sth > 23 || stm < 0 || stm > 59) {
+					throw new Exception("非法时间数值");
+				}
+				//日切时间正常
+				//判断当天时间是否已过
+				Calendar calendar = Calendar.getInstance();
+				if(calendar.get(Calendar.HOUR_OF_DAY) > sth 
+						|| (calendar.get(Calendar.HOUR_OF_DAY) == sth && calendar.get(Calendar.MINUTE) >= stm)) {
+					//当前时间已过
+					calendar.add(Calendar.DAY_OF_YEAR, 1);
+				}
+				calendar.set(Calendar.HOUR_OF_DAY, sth);
+				calendar.set(Calendar.MINUTE, stm);
+				calendar.set(Calendar.SECOND, 0);
+				return calendar.getTime();
+			} catch(Exception e) {
+				logger.warn("系统日切时间[" + switchTime + "]配置异常，无法初始化定时处理任务");
+				return null;
+			}
+		}
+	}
+}
